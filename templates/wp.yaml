@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WordPress'
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+    - Label:
+        default: 'Domain Name and SSL certificates'
+      Parameters:
+      - DomainName
+      - CloudFrontAcmCertificate
+      - ElbAcmCertificate
+    - Label:
+        default: 'WordPress Parameters'
+      Parameters:
+      - BlogTitle
+      - BlogAdminUsername
+      - BlogAdminPassword
+      - BlogAdminEMail
+    - Label:
+        default: 'EC2 Parameters'
+      Parameters:
+      - WebServerKeyName
+      - WebServerInstanceType
+      - WebServerAllowedSSHIPs
+    - Label:
+        default: 'Database Parameters'
+      Parameters:
+      - DBServerInstanceType
+      - DBPassword
+
+
+Parameters:
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc.yaml template.'
+    Type: String
+  DomainName:
+    Description: 'The primary domain name of the blog.'
+    Type: String
+  ElbAcmCertificate:
+    Description: 'The ACM Certificate ARN of certificate for the ELB. Must be created in the same region as this stack!'
+    Type: String
+  BlogTitle:
+    Description: 'The title of the WordPress blog.'
+    Type: String
+    Default: 'Just another WordPress blog'
+  BlogAdminUsername:
+    Description: 'A username for the WordPress admin.'
+    Type: String
+    Default: admin
+  BlogAdminPassword:
+    Description: 'A password for the WordPress admin.'
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  BlogAdminEMail:
+    Description: 'The email address of the WordPress admin.'
+    Type: String
+  BlogVersion:
+    Description: 'WordPress version number'
+    Type: String
+    Default: '4.7.5'
+    ConstraintDescription: 'x.y.z'
+    AllowedPattern: '[0-9]+\.[0-9]+\.[0-9]+'
+  WebServerKeyName:
+    Description: 'Key pair of the ec2-user to establish a SSH connection to the web server.'
+    Type: String
+    Default: ''
+  WebServerAllowedSSHIPs:
+    Description: 'IP range (CDIR) accepted for incoming SSH connections'
+    Type: String
+    Default: '0.0.0.0/0'
+  WebServerInstanceType:
+    Description: 'The instance type of web servers (e.g. t2.micro).'
+    Type: String
+    Default: 't2.micro'
+  DBServerInstanceType:
+    Description: 'The instance type of database server (e.g. db.t2.micro).'
+    Type: String
+    Default: 'db.t2.micro'
+  DBPassword:
+    Description: 'The database password.'
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Mappings:
+  RegionMap:
+    'us-east-1':
+      AMI: 'ami-0b542c1d'
+
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref WebServerKeyName, '']]
+
+Resources:
+
+  LoadBalancerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-elb'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+
+  LoadBalancerSecurityGroupInWorld:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: '0.0.0.0/0'
+
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-ec2'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - FromPort: 80
+        IpProtocol: tcp
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        ToPort: 80
+
+  WebServerSecurityGroupInSSH:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref WebServerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref WebServerAllowedSSHIPs
+
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-rds'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Properties:
+      Subnets:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      Listeners:
+      - InstancePort: 80
+        InstanceProtocol: HTTP
+        LoadBalancerPort: 443
+        Protocol: HTTPS
+        SSLCertificateId: !Ref ElbAcmCertificate
+      HealthCheck:
+        HealthyThreshold: 2
+        Interval: 10
+        Target: 'HTTP:80/'
+        Timeout: 5
+        UnhealthyThreshold: 3
+      SecurityGroups:
+      - !Ref LoadBalancerSecurityGroup
+      Scheme: 'internet-facing'
+      CrossZone: true
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: 'DB subnet group'
+      SubnetIds:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPrivate'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPrivate'
+
+  Database:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      AllocatedStorage: 5
+      BackupRetentionPeriod: 0
+      DBInstanceClass: !Ref DBServerInstanceType
+      DBName: wordpress
+      Engine: MySQL
+      MasterUsername: wordpress
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+      - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: true
+      StorageType: gp2
+
+  WebServerInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref WebServerIAMRole
+
+  WebServerIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies: []
+
+  LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref WebServerInstanceType
+      SecurityGroups:
+      - !Ref WebServerSecurityGroup
+      KeyName: !If [HasKeyName, !Ref WebServerKeyName, !Ref 'AWS::NoValue']
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -x
+          echo 'Updating and installing packages'
+          apt-get -y update && apt-get -y install apache2 php5 php5-mysql php5-mcrypt awscli mysql-client python-pip nfs-common
+
+          echo 'Installing CFN helpers'
+          pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          cp /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+          chmod +x /etc/init.d/cfn-hup
+          update-rc.d cfn-hup defaults
+          service cfn-hup start
+
+          echo 'Configuring EFS'
+          mkdir -p /var/www && mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/" /var/www/
+
+          echo 'Configuring Httpd'
+          echo '<Directory "/var/www/html">
+                  Options Indexes FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+                </Directory>' > '/etc/apache2/conf-enabled/wordpress.conf'
+
+          echo 'Configuring WP'
+          # ensure than only one machine installs wp
+          if mkdir /var/www/lock; then
+            mkdir /var/www/html
+            cd /var/www/html
+            wget -q -T 60 https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            if ! php wp-cli.phar core is-installed --allow-root; then
+              php wp-cli.phar core download --allow-root --version=${BlogVersion}
+              php wp-cli.phar core config --dbname='wordpress' --dbuser='wordpress' --dbpass='${DBPassword}' --dbhost='${Database.Endpoint.Address}' --allow-root
+              php wp-cli.phar core install --url='https://${DomainName}' --title='${BlogTitle}' --admin_user='${BlogAdminUsername}' --admin_password='${BlogAdminPassword}' --admin_email='${BlogAdminEMail}' --skip-email --allow-root
+              sed -i "/$table_prefix = 'wp_';/a\$_SERVER['HTTPS'] = 'on';" /var/www/html/wp-config.php
+            fi
+            chown -R www-data:www-data /var/www/html
+            chmod u+wrx /var/www/html/wp-content/*
+            rm wp-cli.phar
+          fi
+
+          update-rc.d apache2 defaults
+          service apache2 restart
+
+          echo 'All done'
+          /usr/local/bin/cfn-init --stack ${AWS::StackId} --resource LaunchConfiguration --region ${AWS::Region}
+          /usr/local/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+  AutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    DependsOn:
+    - EFSMountTargetA
+    - EFSMountTargetB
+    Properties:
+      LoadBalancerNames:
+      - !Ref LoadBalancer
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      Cooldown: 120
+      HealthCheckGracePeriod: 600
+      HealthCheckType: ELB
+      VPCZoneIdentifier:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      Tags:
+      - PropagateAtLaunch: true
+        Value: wordpress
+        Key: Name
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+  ScalingUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentStep: 1
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 900
+      ScalingAdjustment: 25
+
+  CPUHighAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      EvaluationPeriods: 1
+      Statistic: Average
+      Threshold: 60
+      AlarmDescription: 'Alarm if CPU load is high.'
+      Period: 300
+      AlarmActions:
+      - !Ref ScalingUpPolicy
+      Namespace: 'AWS/EC2'
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref AutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+
+  ScalingDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentStep: 1
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -25
+
+  CPULowAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      EvaluationPeriods: 3
+      Statistic: Average
+      Threshold: 30
+      AlarmDescription: 'Alarm if CPU load is low.'
+      Period: 300
+      AlarmActions:
+      - !Ref ScalingDownPolicy
+      Namespace: 'AWS/EC2'
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref AutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-efs'
+
+  EFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      SecurityGroups:
+      - !Ref EFSSecurityGroup
+
+  EFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      SecurityGroups:
+      - !Ref EFSSecurityGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allowing access to EFS
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        SourceSecurityGroupId: !Ref WebServerSecurityGroup
